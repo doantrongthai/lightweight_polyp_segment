@@ -43,7 +43,7 @@ def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 class GhostModule(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 1, ratio: int = 2) -> None:
         super().__init__()
-        init_channels = out_channels // ratio
+        init_channels = max(out_channels // ratio, 4)
         new_channels = out_channels - init_channels
 
         self.primary_conv = nn.Sequential(
@@ -81,7 +81,7 @@ class LightASPP(nn.Module):
     """
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
-        mid = out_channels // 4
+        mid = max(out_channels // 4, 4)
         self.branch1 = GhostModule(in_channels, mid, 1)
         self.branch2 = nn.Sequential(
             GhostModule(in_channels, mid, 1),
@@ -113,7 +113,7 @@ class LightASPP(nn.Module):
 
 
 class GhostPPD(nn.Module):
-    def __init__(self, in_channels_tuple: Tuple[int, int, int] = (24, 40, 96), decoder_channels: int = 24) -> None:
+    def __init__(self, in_channels_tuple: Tuple[int, int, int] = (24, 48, 96), decoder_channels: int = 24) -> None:
         super().__init__()
         c3, c4, c5 = in_channels_tuple
         dec = decoder_channels
@@ -204,7 +204,7 @@ class ShallowDetailRefiner(nn.Module):
 
 class MobileNetV3SmallMidBackbone(nn.Module):
     """
-    Trục trích xuất đặc trưng sâu hơn (features[0:11]) cung cấp 5 cấp độ đặc trưng.
+    Trục trích xuất đặc trưng sâu hơn (features[0:11]) khớp chuẩn 5 cấp độ kênh.
     """
     def __init__(self, pretrained: bool = True) -> None:
         super().__init__()
@@ -214,9 +214,9 @@ class MobileNetV3SmallMidBackbone(nn.Module):
         self.stage1 = features[0:1]   # Stride 2 (16 ch)
         self.stage2 = features[1:2]   # Stride 4 (24 ch)
         self.stage3 = features[2:4]   # Stride 8 (24 ch)
-        self.stage4 = features[4:9]   # Stride 16 (40 ch)
+        self.stage4 = features[4:9]   # Stride 16 (48 ch thực tế)
         self.stage5 = features[9:11]  # Stride 32 (96 ch)
-        self.out_channels = (16, 24, 24, 40, 96)
+        self.out_channels = (16, 24, 24, 48, 96)
 
     def forward(self, x: torch.Tensor):
         f1 = self.stage1(x)
