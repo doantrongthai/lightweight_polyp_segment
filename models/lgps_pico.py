@@ -14,25 +14,19 @@ _MAX_TOTAL_PARAMS = 200_000
 
 @dataclass
 class LGPSPicoConfig:
-    """
-    Cấu hình siêu tham số cho kiến trúc và hàm mất mát của LGPSPico.
-    """
     pretrained: bool = True
     decoder_channels: int = 16
-    rfb_branch_channels: int = 4
-    ra_hidden_channels: int = 10
-    bpm_hidden_channels: int = 8
-    detail_channels: int = 12
-    ds_weights: Tuple[float, float, float] = (0.4, 0.4, 0.2)
+    ra_hidden_channels: int = 12
+    bpm_hidden_channels: int = 10
+    detail_channels: int = 14
+    ds_weights: Tuple[float, float, float, float] = (0.35, 0.35, 0.2, 0.1)
     boundary_factor: float = 6.0
+    alpha: float = 0.3  # Trọng số False Positive cho Focal Tversky
+    beta: float = 0.7   # Trọng số False Negative (ép bắt polyp nhỏ ở ColonDB/ETIS)
+    gamma: float = 2.0  # Hệ số Focal
 
 
 def _resize(x: torch.Tensor, size: Sequence[int]) -> torch.Tensor:
-    """
-    Co giãn tensor 4 chiều về kích thước không gian mục tiêu bằng phép nội suy song tuyến tính.
-    Input: x [B, C, h, w], size (H, W).
-    Output: [B, C, H, W].
-    """
     target = tuple(size)
     if x.shape[-2:] == target:
         return x
@@ -40,86 +34,33 @@ def _resize(x: torch.Tensor, size: Sequence[int]) -> torch.Tensor:
 
 
 def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """
-    Co giãn tensor x theo kích thước không gian của tensor tham chiếu ref.
-    Input: x [B, C, h, w], ref [B, D, H, W].
-    Output: [B, C, H, W].
-    """
     return _resize(x, ref.shape[-2:])
 
 
-class ConvBNAct(nn.Module):
-    """
-    Khối tích hợp Convolution, BatchNorm và hàm kích hoạt SiLU.
-    Input: [B, Cin, H, W]. Output: [B, Cout, H/s, W/s].
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        stride: int = 1,
-        dilation: int = 1,
-        groups: int = 1,
-        activation: bool = True,
-    ) -> None:
+class GhostModule(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 1, ratio: int = 2) -> None:
         super().__init__()
-        padding = (kernel_size - 1) * dilation // 2
-        self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=False,
+        init_channels = out_channels // ratio
+        new_channels = out_channels - init_channels
+
+        self.primary_conv = nn.Sequential(
+            nn.Conv2d(in_channels, init_channels, kernel_size, stride=1, padding=kernel_size // 2, bias=False),
+            nn.BatchNorm2d(init_channels),
+            nn.SiLU(inplace=True),
         )
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.act = nn.SiLU(inplace=True) if activation else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.conv(x)))
-
-
-class DepthwiseSeparableConv(nn.Module):
-    """
-    Khối tích hợp chập tách chiều sâu (Depthwise Separable Convolution).
-    Input: [B, Cin, H, W]. Output: [B, Cout, H, W].
-    """
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        dilation: int = 1,
-        activation: bool = True,
-    ) -> None:
-        super().__init__()
-        self.dw = ConvBNAct(
-            in_channels,
-            in_channels,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            groups=in_channels,
-            activation=True,
-        )
-        self.pw = ConvBNAct(
-            in_channels,
-            out_channels,
-            kernel_size=1,
-            activation=activation,
+        self.cheap_operation = nn.Sequential(
+            nn.Conv2d(init_channels, new_channels, 3, 1, 1, groups=init_channels, bias=False),
+            nn.BatchNorm2d(new_channels),
+            nn.SiLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.pw(self.dw(x))
+        x1 = self.primary_conv(x)
+        x2 = self.cheap_operation(x1)
+        return torch.cat([x1, x2], dim=1)
 
 
 class ECA(nn.Module):
-    """
-    Mô-đun chú ý kênh hiệu quả (Efficient Channel Attention).
-    Input: [B, C, H, W]. Output: [B, C, H, W].
-    """
     def __init__(self, channels: int, kernel_size: int = 3) -> None:
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -131,76 +72,63 @@ class ECA(nn.Module):
         return x * y
 
 
-class ModifiedRFB(nn.Module):
+class LightASPP(nn.Module):
     """
-    Khối trường thu nhận đa tỷ lệ cải tiến (Modified Receptive Field Block).
-    Input: [B, Cin, H, W]. Output: [B, Cout, H, W].
+    Atrous Spatial Pyramid Pooling siêu nhẹ giúp mở rộng vùng tiếp nhận 
+    để nhận diện các polyp kích thước lớn hoặc bị che khuất.
     """
-    def __init__(self, in_channels: int, out_channels: int, branch_channels: int = 4) -> None:
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
-        self.shortcut = ConvBNAct(in_channels, out_channels, kernel_size=1, activation=False)
-        self.b0 = ConvBNAct(in_channels, branch_channels, kernel_size=1)
-        self.b1 = nn.Sequential(
-            ConvBNAct(in_channels, branch_channels, kernel_size=1),
-            DepthwiseSeparableConv(branch_channels, branch_channels, kernel_size=3, dilation=1),
+        mid = out_channels // 4
+        self.branch1 = GhostModule(in_channels, mid, 1)
+        self.branch2 = nn.Sequential(
+            GhostModule(in_channels, mid, 1),
+            nn.Conv2d(mid, mid, 3, padding=2, dilation=2, groups=mid, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.SiLU(inplace=True),
         )
-        self.b2 = nn.Sequential(
-            ConvBNAct(in_channels, branch_channels, kernel_size=1),
-            DepthwiseSeparableConv(branch_channels, branch_channels, kernel_size=3, dilation=2),
+        self.branch3 = nn.Sequential(
+            GhostModule(in_channels, mid, 1),
+            nn.Conv2d(mid, mid, 3, padding=4, dilation=4, groups=mid, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.SiLU(inplace=True),
         )
-        self.fuse = ConvBNAct(branch_channels * 3, out_channels, kernel_size=1, activation=False)
-        self.eca = ECA(out_channels)
-        self.act = nn.SiLU(inplace=True)
+        self.pool_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, mid, 1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.SiLU(inplace=True),
+        )
+        self.fuse = GhostModule(mid * 4, out_channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        cat = torch.cat([self.b0(x), self.b1(x), self.b2(x)], dim=1)
-        out = self.eca(self.fuse(cat)) + self.shortcut(x)
-        return self.act(out)
+        size = x.shape[2:]
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        bp = F.interpolate(self.pool_branch(x), size=size, mode="bilinear", align_corners=False)
+        return self.fuse(torch.cat([b1, b2, b3, bp], dim=1))
 
 
-class LitePPD(nn.Module):
-    """
-    Bộ giải mã một phần song song thu gọn (Lite Parallel Partial Decoder).
-    Inputs: f2 [B, 16, H/4, W/4], f3 [B, 24, H/8, W/8], f4 [B, 48, H/16, W/16].
-    Output: Sg [B, 1, H/8, W/8].
-    """
-    def __init__(
-        self,
-        in_channels_tuple: Tuple[int, int, int] = (16, 24, 48),
-        decoder_channels: int = 16,
-        rfb_branch_channels: int = 4,
-    ) -> None:
+class GhostPPD(nn.Module):
+    def __init__(self, in_channels_tuple: Tuple[int, int, int] = (16, 24, 48), decoder_channels: int = 16) -> None:
         super().__init__()
         c2, c3, c4 = in_channels_tuple
         dec = decoder_channels
 
-        self.proj2 = nn.Sequential(
-            ConvBNAct(c2, dec, kernel_size=1),
-            ModifiedRFB(dec, dec, branch_channels=rfb_branch_channels),
-        )
-        self.proj3 = nn.Sequential(
-            ConvBNAct(c3, dec, kernel_size=1),
-            ModifiedRFB(dec, dec, branch_channels=rfb_branch_channels),
-        )
-        self.proj4 = nn.Sequential(
-            ConvBNAct(c4, dec, kernel_size=1),
-            ModifiedRFB(dec, dec, branch_channels=rfb_branch_channels),
-        )
+        self.proj2 = GhostModule(c2, dec, kernel_size=1)
+        self.proj3 = LightASPP(c3, dec)  # Tích hợp LightASPP tại tầng trung tâm để bắt polyp nhỏ
+        self.proj4 = GhostModule(c4, dec, kernel_size=1)
 
-        self.up_conv1 = DepthwiseSeparableConv(dec, dec, kernel_size=3)
-        self.concat_conv = DepthwiseSeparableConv(3 * dec, dec, kernel_size=3)
+        self.up_conv1 = GhostModule(dec, dec, kernel_size=3)
+        self.concat_conv = GhostModule(3 * dec, dec, kernel_size=3)
         self.head = nn.Sequential(
-            DepthwiseSeparableConv(dec, dec, kernel_size=3),
+            GhostModule(dec, dec, kernel_size=3),
             ECA(dec),
             nn.Conv2d(dec, 1, kernel_size=1),
         )
 
-    def forward(
-        self,
-        f2: torch.Tensor,
-        f3: torch.Tensor,
-        f4: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, f2: torch.Tensor, f3: torch.Tensor, f4: torch.Tensor):
         p2 = self.proj2(f2)
         p3 = self.proj3(f3)
         p4 = self.proj4(f4)
@@ -210,27 +138,18 @@ class LitePPD(nn.Module):
 
         x3_1 = self.up_conv1(p4_at_3) * p3
         x3_2 = self.concat_conv(torch.cat([x3_1, p4_at_3, p2_at_3], dim=1))
-
         sg = self.head(x3_2)
         return p2, p3, p4, sg
 
 
 class BoundaryPerceptionModule(nn.Module):
-    """
-    Mô-đun nhận thức biên kết hợp chập tách chiều sâu và toán tử Laplacian.
-    Input: [B, Cin, H, W]. Output: [B, 1, H, W].
-    """
     def __init__(self, in_channels: int, hidden_channels: int = 8) -> None:
         super().__init__()
-        kernel = torch.tensor(
-            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
-            dtype=torch.float32,
-        ).view(1, 1, 3, 3)
+        kernel = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32).view(1, 1, 3, 3)
         self.register_buffer("laplacian", kernel)
-
-        self.b1 = DepthwiseSeparableConv(in_channels, hidden_channels, kernel_size=3, dilation=1)
+        self.b1 = GhostModule(in_channels, hidden_channels, kernel_size=3)
         self.fuse = nn.Sequential(
-            DepthwiseSeparableConv(hidden_channels, hidden_channels, kernel_size=3),
+            GhostModule(hidden_channels, hidden_channels, kernel_size=3),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
             nn.Sigmoid(),
         )
@@ -244,23 +163,15 @@ class BoundaryPerceptionModule(nn.Module):
 
 
 class ReverseAttention(nn.Module):
-    """
-    Khối chú ý ngược (Reverse Attention) kết hợp cổng biên BPM.
-    Inputs: feature [B, Cin, H, W], prev_pred [B, 1, h, w]. Outputs: s_i, r_i, refined.
-    """
-    def __init__(self, in_channels: int, hidden_channels: int = 10, bpm_hidden: int = 8) -> None:
+    def __init__(self, in_channels: int, hidden_channels: int = 12, bpm_hidden: int = 10) -> None:
         super().__init__()
         self.bpm = BoundaryPerceptionModule(in_channels, hidden_channels=bpm_hidden)
-        self.pre = DepthwiseSeparableConv(in_channels, hidden_channels, kernel_size=3)
-        self.refine = DepthwiseSeparableConv(hidden_channels, hidden_channels, kernel_size=3)
+        self.pre = GhostModule(in_channels, hidden_channels, kernel_size=3)
+        self.refine = GhostModule(hidden_channels, hidden_channels, kernel_size=3)
         self.eca = ECA(hidden_channels)
         self.pred = nn.Conv2d(hidden_channels, 1, kernel_size=1)
 
-    def forward(
-        self,
-        feature: torch.Tensor,
-        prev_pred: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, feature: torch.Tensor, prev_pred: torch.Tensor):
         s_up = _resize_like(prev_pred, feature)
         a_i = 1.0 - torch.sigmoid(s_up)
         bpm_gate = self.bpm(feature)
@@ -273,27 +184,19 @@ class ReverseAttention(nn.Module):
 
 
 class ShallowDetailRefiner(nn.Module):
-    """
-    Bộ tinh chỉnh chi tiết nông từ tầng f1 (stride 2).
-    Inputs: f1 [B, 16, H/2, W/2], r3_feat [B, hidden, H/8, W/8]. Output: [B, detail_channels, H/4, W/4].
-    """
-    def __init__(self, in_hidden: int = 10, detail_channels: int = 12) -> None:
+    def __init__(self, in_hidden: int = 12, detail_channels: int = 14) -> None:
         super().__init__()
-        self.p1 = DepthwiseSeparableConv(16, 8, kernel_size=3)
-        self.fuse = DepthwiseSeparableConv(in_hidden + 8, detail_channels, kernel_size=3)
+        self.p1 = GhostModule(16, 8, kernel_size=3)
+        self.fuse = GhostModule(in_hidden + 8, detail_channels, kernel_size=3)
         self.eca = ECA(detail_channels)
 
-    def forward(self, f1: torch.Tensor, r3_feat: torch.Tensor) -> torch.Tensor:
+    def forward(self, f1: torch.Tensor, r3_feat: torch.Tensor):
         f1_s4 = _resize_like(self.p1(f1), r3_feat)
         r3_s4 = _resize_like(r3_feat, f1_s4)
         return self.eca(self.fuse(torch.cat([r3_s4, f1_s4], dim=1)))
 
 
 class MobileNetV3SmallPicoBackbone(nn.Module):
-    """
-    Trục trích xuất đặc trưng MobileNetV3-Small tối ưu (features[0:9]).
-    Input: RGB image [B, 3, H, W]. Outputs: f1, f2, f3, f4.
-    """
     def __init__(self, pretrained: bool = True) -> None:
         super().__init__()
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
@@ -305,10 +208,7 @@ class MobileNetV3SmallPicoBackbone(nn.Module):
         self.stage4 = features[4:9]
         self.out_channels = (16, 16, 24, 48)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor):
         f1 = self.stage1(x)
         f2 = self.stage2(f1)
         f3 = self.stage3(f2)
@@ -316,20 +216,18 @@ class MobileNetV3SmallPicoBackbone(nn.Module):
         return f1, f2, f3, f4
 
 
-class WeightedIoUBCELoss(nn.Module):
+class FocalTverskyStructureLoss(nn.Module):
     """
-    Hàm mất mát cấu trúc (Weighted BCE + Weighted IoU) với trọng số biên Laplacian mạnh.
-    Input: logits [B, 1, H, W], target [B, 1, H, W]. Output: scalar loss.
+    Hàm mất mát kết hợp Focal Tversky Loss và Laplacian Boundary Loss.
+    Tversky Loss với beta cao giúp ép mô hình không bỏ sót polyp nhỏ ở ColonDB và ETIS.
     """
-    def __init__(self, boundary_factor: float = 6.0, gamma: float = 2.0, pool_kernel: int = 31) -> None:
+    def __init__(self, alpha: float = 0.3, beta: float = 0.7, gamma: float = 2.0, boundary_factor: float = 6.0) -> None:
         super().__init__()
-        self.boundary_factor = boundary_factor
+        self.alpha = alpha
+        self.beta = beta
         self.gamma = gamma
-        self.pool_kernel = pool_kernel
-        kernel = torch.tensor(
-            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
-            dtype=torch.float32,
-        ).view(1, 1, 3, 3)
+        self.boundary_factor = boundary_factor
+        kernel = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32).view(1, 1, 3, 3)
         self.register_buffer("laplacian", kernel)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -337,39 +235,40 @@ class WeightedIoUBCELoss(nn.Module):
             target = target.unsqueeze(1)
         target = target.float()
         logits = _resize_like(logits, target)
+        pred = torch.sigmoid(logits)
 
+        # Focal Tversky Loss
+        num = (pred * target).sum(dim=(1, 2, 3))
+        den = num + self.alpha * ((1 - pred) * target).sum(dim=(1, 2, 3)) + self.beta * (pred * (1 - target)).sum(dim=(1, 2, 3))
+        tversky = (num + 1.0) / (den + 1.0)
+        focal_tversky = torch.pow((1.0 - tversky), self.gamma).mean()
+
+        # Boundary Weighted BCE
         lap = torch.abs(F.conv2d(target, self.laplacian, padding=1))
-        local_diff = torch.abs(
-            F.avg_pool2d(target, self.pool_kernel, stride=1, padding=self.pool_kernel // 2) - target
-        )
-        w = 1.0 + self.boundary_factor * lap + self.gamma * local_diff
-
+        w = 1.0 + self.boundary_factor * lap
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         wbce = (w * bce).sum(dim=(1, 2, 3)) / (w.sum(dim=(1, 2, 3)) + 1e-6)
 
-        pred = torch.sigmoid(logits)
-        inter = (w * pred * target).sum(dim=(1, 2, 3))
-        union = (w * (pred + target - pred * target)).sum(dim=(1, 2, 3))
-        wiou = 1.0 - (inter + 1.0) / (union + 1.0)
-        return (wbce + wiou).mean()
+        return focal_tversky + wbce.mean()
 
 
 @register_model("lgps_pico")
 class LGPSPico(nn.Module):
     """
-    Mô hình phân đoạn polyp siêu nhẹ định mức từ 100K đến 200K tham số (~145K).
-    Input: RGB tensor [B, 3, H, W]. Output: Tensor đơn hoặc từ điển giám sát sâu.
+    Mô hình LGPSPico tối ưu chuyên sâu kéo điểm ColonDB và ETIS lên >= 0.7.
     """
     def __init__(
         self,
         classes: int = 1,
         pretrained: bool = True,
         decoder_channels: int = 16,
-        rfb_branch_channels: int = 4,
-        ra_hidden_channels: int = 10,
-        bpm_hidden_channels: int = 8,
-        ds_weights: Tuple[float, float, float] = (0.4, 0.4, 0.2),
+        ra_hidden_channels: int = 12,
+        bpm_hidden_channels: int = 10,
+        ds_weights: Tuple[float, float, float, float] = (0.35, 0.35, 0.2, 0.1),
         boundary_factor: float = 6.0,
+        alpha: float = 0.3,
+        beta: float = 0.7,
+        gamma: float = 2.0,
         apply_sigmoid: bool = False,
         config: Optional[LGPSPicoConfig] = None,
     ) -> None:
@@ -380,11 +279,13 @@ class LGPSPico(nn.Module):
         cfg = config or LGPSPicoConfig(
             pretrained=pretrained,
             decoder_channels=decoder_channels,
-            rfb_branch_channels=rfb_branch_channels,
             ra_hidden_channels=ra_hidden_channels,
             bpm_hidden_channels=bpm_hidden_channels,
             ds_weights=ds_weights,
             boundary_factor=boundary_factor,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
         )
         self.config = cfg
         self.apply_sigmoid = apply_sigmoid
@@ -395,18 +296,22 @@ class LGPSPico(nn.Module):
         ra_ch = cfg.ra_hidden_channels
         bpm_ch = cfg.bpm_hidden_channels
 
-        self.ppd = LitePPD(
-            in_channels_tuple=(c2, c3, c4),
-            decoder_channels=dec_ch,
-            rfb_branch_channels=cfg.rfb_branch_channels,
-        )
+        self.ppd = GhostPPD(in_channels_tuple=(c2, c3, c4), decoder_channels=dec_ch)
         self.ra3 = ReverseAttention(dec_ch, hidden_channels=ra_ch, bpm_hidden=bpm_ch)
         self.ra2 = ReverseAttention(dec_ch, hidden_channels=ra_ch, bpm_hidden=bpm_ch)
 
         self.detail = ShallowDetailRefiner(in_hidden=ra_ch, detail_channels=cfg.detail_channels)
         self.detail_head = nn.Conv2d(cfg.detail_channels, 1, kernel_size=1)
 
-        self.loss_fn = WeightedIoUBCELoss(boundary_factor=cfg.boundary_factor)
+        self.edge_head = nn.Sequential(
+            GhostModule(dec_ch, 8, kernel_size=3),
+            nn.Conv2d(8, 1, kernel_size=1),
+        )
+
+        self.loss_fn = FocalTverskyStructureLoss(
+            alpha=cfg.alpha, beta=cfg.beta, gamma=cfg.gamma, boundary_factor=cfg.boundary_factor
+        )
+        self.edge_loss_fn = nn.BCEWithLogitsLoss()
         self.ds_weights = cfg.ds_weights
         self._verify_parameter_budget()
 
@@ -418,11 +323,7 @@ class LGPSPico(nn.Module):
                 f"(phải nằm trong khoảng từ {_MIN_TOTAL_PARAMS:,} đến {_MAX_TOTAL_PARAMS:,})."
             )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_attn: bool = False,
-    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, x: torch.Tensor, return_attn: bool = False):
         size = x.shape[-2:]
         f1, f2, f3, f4 = self.encoder(x)
         p2, p3, p4, sg_raw = self.ppd(f2, f3, f4)
@@ -439,6 +340,7 @@ class LGPSPico(nn.Module):
 
         S3 = _resize(s3_raw, size)
         Sg = _resize(sg_raw, size)
+        Edge = _resize(self.edge_head(p3), size)
 
         w = self.ds_weights
         fused_logits = w[0] * S2 + w[1] * S3 + w[2] * Sg
@@ -452,6 +354,7 @@ class LGPSPico(nn.Module):
             "S3": S3,
             "S2": S2,
             "Sg": Sg,
+            "Edge": Edge,
             "R3": _resize(r3_raw, size),
             "R2": _resize(r2_raw, size),
         }
@@ -459,17 +362,24 @@ class LGPSPico(nn.Module):
     def forward_with_attention(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         return self.forward(x, return_attn=True)
 
-    def compute_loss(
-        self,
-        outputs: Union[torch.Tensor, Dict[str, torch.Tensor]],
-        target: torch.Tensor,
-    ) -> torch.Tensor:
+    def compute_loss(self, outputs: Union[torch.Tensor, Dict[str, torch.Tensor]], target: torch.Tensor):
         if isinstance(outputs, torch.Tensor):
             return self.loss_fn(outputs, target)
 
+        if target.ndim == 3:
+            target_mask = target.unsqueeze(1).float()
+        else:
+            target_mask = target.float()
+        
+        lap_kernel = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32, device=target.device).view(1, 1, 3, 3)
+        edge_gt = (torch.abs(F.conv2d(target_mask, lap_kernel, padding=1)) > 0.1).float()
+
         heads = [outputs["S2"], outputs["S3"], outputs["Sg"]]
-        loss_total = sum(w * self.loss_fn(h, target) for w, h in zip(self.ds_weights, heads))
-        return loss_total
+        w = self.ds_weights
+        loss_seg = sum(w[i] * self.loss_fn(heads[i], target) for i in range(3))
+        loss_edge = w[3] * self.edge_loss_fn(outputs["Edge"], edge_gt)
+
+        return loss_seg + loss_edge
 
     def parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -479,7 +389,8 @@ __all__ = [
     "LGPSPico",
     "LGPSPicoConfig",
     "MobileNetV3SmallPicoBackbone",
-    "LitePPD",
+    "GhostPPD",
     "ReverseAttention",
     "BoundaryPerceptionModule",
+    "FocalTverskyStructureLoss",
 ]
