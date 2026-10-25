@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple, Union
 
@@ -6,26 +7,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
-try:
-    from . import register_model
-except ImportError:
-    def register_model(name: str):
-        def decorator(cls):
-            return cls
-        return decorator
-
+from . import register_model
 
 _MAX_TOTAL_PARAMS = 1_000_000
 
 
 @dataclass
 class LGPSTinyConfig:
-    """Hyperparameter configuration for LGPSTiny architecture and loss.
-
-    Input: configuration fields. Output: configuration instance.
-    Source: Custom configuration for PraNet-inspired lightweight segmentation.
-    """
-
+    """Hyperparameter configuration for LGPSTiny architecture."""
     pretrained: bool = True
     truncate_576: bool = True
     decoder_channels: int = 24
@@ -38,33 +27,20 @@ class LGPSTinyConfig:
 
 
 def _resize(x: torch.Tensor, size: Sequence[int]) -> torch.Tensor:
-    """Resize a 4D tensor to target spatial size using bilinear interpolation.
-
-    Input: x [B,C,h,w], size (H,W). Output: [B,C,H,W].
-    Source: Standard FCN/UNet spatial alignment convention.
-    """
+    """Resize a 4D tensor to target spatial size using bilinear interpolation."""
     target = tuple(size)
     if x.shape[-2:] == target:
         return x
-    return F.interpolate(x, size=target, mode="bilinear", align_corners=False)
+    return F.interpolate(x, size=target, mode="bilinear", align_corners=True)
 
 
 def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """Resize a 4D tensor to match the spatial dimensions of a reference tensor.
-
-    Input: x [B,C,h,w], ref [B,D,H,W]. Output: [B,C,H,W].
-    Source: PraNet (Fan et al., MICCAI 2020).
-    """
+    """Resize a 4D tensor to match spatial dimensions of a reference tensor."""
     return _resize(x, ref.shape[-2:])
 
 
 class ConvBNAct(nn.Module):
-    """Standard Convolution + BatchNorm + SiLU activation block.
-
-    Input: [B,Cin,H,W]. Output: [B,Cout,H/s,W/s].
-    Source: MobileNetV3 / EfficientNet building block (Howard et al., ICCV 2019).
-    """
-
+    """Standard Convolution + BatchNorm + SiLU activation block."""
     def __init__(
         self,
         in_channels: int,
@@ -91,20 +67,11 @@ class ConvBNAct(nn.Module):
         self.act = nn.SiLU(inplace=True) if activation else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply Conv2d, BatchNorm2d and optional SiLU.
-
-        Input: [B,Cin,H,W]. Output: [B,Cout,H/s,W/s].
-        """
         return self.act(self.bn(self.conv(x)))
 
 
 class DepthwiseSeparableConv(nn.Module):
-    """Depthwise-separable 2D convolution block (Depthwise kxk + Pointwise 1x1).
-
-    Input: [B,Cin,H,W]. Output: [B,Cout,H,W].
-    Source: MobileNets (Howard et al., arXiv 2017).
-    """
-
+    """Depthwise-separable 2D convolution block."""
     def __init__(
         self,
         in_channels: int,
@@ -130,42 +97,24 @@ class DepthwiseSeparableConv(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply depthwise spatial filtering followed by pointwise channel mixing.
-
-        Input: [B,Cin,H,W]. Output: [B,Cout,H,W].
-        """
         return self.pw(self.dw(x))
 
 
 class ECA(nn.Module):
-    """Efficient Channel Attention module using a fast 1D convolution.
-
-    Input: [B,C,H,W]. Output: [B,C,H,W].
-    Source: ECA-Net (Wang et al., CVPR 2020).
-    """
-
+    """Efficient Channel Attention module."""
     def __init__(self, channels: int, kernel_size: int = 3) -> None:
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.conv = nn.Conv1d(1, 1, kernel_size, padding=kernel_size // 2, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute and apply channel-wise attention weights.
-
-        Input: [B,C,H,W]. Output: [B,C,H,W].
-        """
         y = self.pool(x).squeeze(-1).transpose(1, 2)
         y = torch.sigmoid(self.conv(y)).transpose(1, 2).unsqueeze(-1)
         return x * y
 
 
 class ModifiedRFB(nn.Module):
-    """Lightweight Modified Receptive Field Block with depthwise-separable branches.
-
-    Input: [B,Cin,H,W]. Output: [B,Cout,H,W].
-    Source: PraNet (Fan et al., MICCAI 2020) and RFBNet (Liu et al., ECCV 2018).
-    """
-
+    """Lightweight Modified Receptive Field Block with depthwise-separable branches."""
     def __init__(self, in_channels: int, out_channels: int, branch_channels: int = 8) -> None:
         super().__init__()
         self.shortcut = ConvBNAct(in_channels, out_channels, kernel_size=1, activation=False)
@@ -189,23 +138,13 @@ class ModifiedRFB(nn.Module):
         self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Aggregate multi-dilation receptive fields with residual shortcut.
-
-        Input: [B,Cin,H,W]. Output: [B,Cout,H,W].
-        """
         cat = torch.cat([self.b0(x), self.b1(x), self.b2(x), self.b3(x)], dim=1)
         out = self.eca(self.fuse(cat)) + self.shortcut(x)
         return self.act(out)
 
 
 class LitePPD(nn.Module):
-    """Lightweight Parallel Partial Decoder using f3, f4, f5 and depthwise-separable convs.
-
-    Inputs: f3 [B,24,H/8,W/8], f4 [B,48,H/16,W/16], f5 [B,96,H/32,W/32].
-    Outputs: Tuple of projected features (p3, p4, p5) each [B,C,H_i,W_i] and global map Sg [B,1,H/8,W/8].
-    Source: PraNet Parallel Partial Decoder (Fan et al., MICCAI 2020).
-    """
-
+    """Lightweight Parallel Partial Decoder."""
     def __init__(
         self,
         in_channels_tuple: Tuple[int, int, int] = (24, 48, 96),
@@ -249,11 +188,6 @@ class LitePPD(nn.Module):
         f4: torch.Tensor,
         f5: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project f3, f4, f5 to decoder_channels and fuse in parallel into Sg.
-
-        Inputs: f3 [B,24,H/8,W/8], f4 [B,48,H/16,W/16], f5 [B,96,H/32,W/32].
-        Outputs: p3 [B,C,H/8,W/8], p4 [B,C,H/16,W/16], p5 [B,C,H/32,W/32], sg [B,1,H/8,W/8].
-        """
         p3 = self.proj3(f3)
         p4 = self.proj4(f4)
         p5 = self.proj5(f5)
@@ -274,12 +208,7 @@ class LitePPD(nn.Module):
 
 
 class BoundaryPerceptionModule(nn.Module):
-    """Boundary Perception Module (BPM) using depthwise-separable dilated convolutions.
-
-    Input: [B,Cin,H,W]. Output: boundary attention gate [B,1,H,W].
-    Source: Boundary-aware polyp segmentation (PraNet / BDG-Net).
-    """
-
+    """Boundary Perception Module (BPM)."""
     def __init__(self, in_channels: int, hidden_channels: int = 16) -> None:
         super().__init__()
         kernel = torch.tensor(
@@ -297,10 +226,6 @@ class BoundaryPerceptionModule(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute boundary enhancement gate combining learned DS-Conv and Laplacian prior.
-
-        Input: [B,Cin,H,W]. Output: [B,1,H,W].
-        """
         mean_map = x.mean(dim=1, keepdim=True)
         lap_edge = torch.abs(F.conv2d(mean_map, self.laplacian, padding=1))
         lap_edge = lap_edge / (lap_edge.amax(dim=(-2, -1), keepdim=True) + 1e-6)
@@ -309,13 +234,7 @@ class BoundaryPerceptionModule(nn.Module):
 
 
 class ReverseAttention(nn.Module):
-    """Reverse Attention block: A_i = (1 - sigmoid(upsample(S_{i+1}))) * BPM(f_i).
-
-    Inputs: feature [B,Cin,H,W], prev_pred [B,1,h,w].
-    Outputs: s_i [B,1,H,W], r_i (attention map) [B,1,H,W], refined_feat [B,hidden,H,W].
-    Source: PraNet (Fan et al., MICCAI 2020).
-    """
-
+    """Reverse Attention block."""
     def __init__(self, in_channels: int, hidden_channels: int = 16, bpm_hidden: int = 16) -> None:
         super().__init__()
         self.bpm = BoundaryPerceptionModule(in_channels, hidden_channels=bpm_hidden)
@@ -330,11 +249,6 @@ class ReverseAttention(nn.Module):
         feature: torch.Tensor,
         prev_pred: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Mine complementary boundary regions using reverse attention and BPM.
-
-        Inputs: feature [B,Cin,H,W], prev_pred [B,1,h,w].
-        Outputs: s_i [B,1,H,W], r_i [B,1,H,W], refined [B,hidden,H,W].
-        """
         s_up = _resize_like(prev_pred, feature)
         a_i = 1.0 - torch.sigmoid(s_up)
         bpm_gate = self.bpm(feature)
@@ -347,13 +261,7 @@ class ReverseAttention(nn.Module):
 
 
 class ShallowDetailRefiner(nn.Module):
-    """Lightweight detail injection from stride-4 f2 and stride-2 f1 into RA3 output.
-
-    Inputs: f1 [B,16,H/2,W/2], f2 [B,16,H/4,W/4], r3_feat [B,hidden,H/8,W/8].
-    Output: refined high-resolution feature [B,hidden,H/4,W/4].
-    Source: U-Net / CaraNet shallow boundary refinement.
-    """
-
+    """Lightweight detail injection from shallow features."""
     def __init__(self, in_hidden: int = 16, detail_channels: int = 16) -> None:
         super().__init__()
         self.p1 = DepthwiseSeparableConv(16, 8, kernel_size=3)
@@ -362,11 +270,6 @@ class ShallowDetailRefiner(nn.Module):
         self.eca = ECA(detail_channels)
 
     def forward(self, f1: torch.Tensor, f2: torch.Tensor, r3_feat: torch.Tensor) -> torch.Tensor:
-        """Align and fuse shallow edge cues at stride-4 resolution.
-
-        Inputs: f1 [B,16,H/2,W/2], f2 [B,16,H/4,W/4], r3_feat [B,C,H/8,W/8].
-        Output: [B,detail_channels,H/4,W/4].
-        """
         f1_s4 = _resize_like(self.p1(f1), f2)
         f2_s4 = self.p2(f2)
         r3_s4 = _resize_like(r3_feat, f2)
@@ -374,18 +277,7 @@ class ShallowDetailRefiner(nn.Module):
 
 
 class MobileNetV3SmallBackbone(nn.Module):
-    """ImageNet-pretrained MobileNetV3-Small encoder without classifier or 576-ch expansion.
-
-    Input: RGB image [B,3,H,W].
-    Outputs:
-        f1: [B,16,H/2,W/2]   (features[0])
-        f2: [B,16,H/4,W/4]   (features[1])
-        f3: [B,24,H/8,W/8]   (features[2..3])
-        f4: [B,48,H/16,W/16] (features[4..8] - full stride-16 stage including 48-ch blocks)
-        f5: [B,96,H/32,W/32] (features[9..11] - 48->96 stage, cutting features[12] 576-ch)
-    Source: Howard et al., "Searching for MobileNetV3", ICCV 2019.
-    """
-
+    """ImageNet-pretrained MobileNetV3-Small encoder."""
     def __init__(self, pretrained: bool = True, truncate_576: bool = True) -> None:
         super().__init__()
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
@@ -406,10 +298,6 @@ class MobileNetV3SmallBackbone(nn.Module):
         self,
         x: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Extract 5 hierarchical feature maps at strides 2, 4, 8, 16, 32.
-
-        Input: [B,3,H,W]. Outputs: (f1, f2, f3, f4, f5).
-        """
         f1 = self.stage1(x)
         f2 = self.stage2(f1)
         f3 = self.stage3(f2)
@@ -418,20 +306,44 @@ class MobileNetV3SmallBackbone(nn.Module):
         return f1, f2, f3, f4, f5
 
 
+class WeightedIoUBCELoss(nn.Module):
+    """Weighted BCE + Weighted IoU loss with explicit Laplacian boundary weight."""
+    def __init__(self, boundary_factor: float = 4.0, gamma: float = 2.0, pool_kernel: int = 31) -> None:
+        super().__init__()
+        self.boundary_factor = boundary_factor
+        self.gamma = gamma
+        self.pool_kernel = pool_kernel
+        kernel = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        self.register_buffer("laplacian", kernel)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if target.ndim == 3:
+            target = target.unsqueeze(1)
+        target = target.float()
+        logits = _resize_like(logits, target)
+
+        lap = torch.abs(F.conv2d(target, self.laplacian, padding=1))
+        local_diff = torch.abs(
+            F.avg_pool2d(target, self.pool_kernel, stride=1, padding=self.pool_kernel // 2) - target
+        )
+        w = 1.0 + self.boundary_factor * lap + self.gamma * local_diff
+
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        wbce = (w * bce).sum(dim=(1, 2, 3)) / (w.sum(dim=(1, 2, 3)) + 1e-6)
+
+        pred = torch.sigmoid(logits)
+        inter = (w * pred * target).sum(dim=(1, 2, 3))
+        union = (w * (pred + target - pred * target)).sum(dim=(1, 2, 3))
+        wiou = 1.0 - (inter + 1.0) / (union + 1.0)
+        return (wbce + wiou).mean()
+
+
 @register_model("lgps_tiny")
 class LGPSTiny(nn.Module):
-    """Ultra-lightweight PraNet-inspired polyp segmentation network (< 1M params, < 0.6 GFLOPs).
-
-    Input: RGB tensor [B,3,H,W].
-    Output:
-        - Normal mode (return_attn=False): single logits tensor [B,1,H,W] (or probabilities if
-          apply_sigmoid=True), seamlessly compatible with standard repository evaluation loops
-          while fusing gradients across (S3, S4, S5, Sg) during single-output training.
-        - Attention mode (return_attn=True or forward_with_attention): dictionary containing
-          {"pred", "S3", "S4", "S5", "Sg", "R3", "R4", "R5"}.
-    Source: Inspired by PraNet (Fan et al., MICCAI 2020) and MobileNetV3 (Howard et al., ICCV 2019).
-    """
-
+    """Ultra-lightweight PraNet-inspired polyp segmentation network (< 1M params)."""
     def __init__(
         self,
         classes: int = 1,
@@ -482,30 +394,20 @@ class LGPSTiny(nn.Module):
         self.detail = ShallowDetailRefiner(in_hidden=ra_ch, detail_channels=cfg.detail_channels)
         self.detail_head = nn.Conv2d(cfg.detail_channels, 1, kernel_size=1)
 
-        self.register_buffer(
-            "ds_weights_buf",
-            torch.tensor(cfg.ds_weights, dtype=torch.float32),
-        )
+        self.loss_fn = WeightedIoUBCELoss(boundary_factor=cfg.boundary_factor)
+        self.ds_weights = cfg.ds_weights
         self._verify_parameter_budget()
 
     def _verify_parameter_budget(self) -> None:
-        """Assert that total parameters (including non-trainable) are strictly < 1,000,000."""
-        total = self.parameter_count(trainable_only=False)
+        total = self.parameter_count()
         if total >= _MAX_TOTAL_PARAMS:
-            raise RuntimeError(
-                f"LGPSTiny exceeds total parameter budget: {total:,} >= {_MAX_TOTAL_PARAMS:,}"
-            )
+            raise RuntimeError(f"LGPSTiny exceeds total parameter budget: {total:,} >= {_MAX_TOTAL_PARAMS:,}")
 
     def forward(
         self,
         x: torch.Tensor,
         return_attn: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Execute forward pass.
-
-        Input: x [B,3,H,W], return_attn (bool).
-        Output: Tensor [B,1,H,W] when return_attn=False; Dict[str, Tensor] when return_attn=True.
-        """
         size = x.shape[-2:]
         f1, f2, f3, f4, f5 = self.encoder(x)
         p3, p4, p5, sg_raw = self.ppd(f3, f4, f5)
@@ -525,7 +427,7 @@ class LGPSTiny(nn.Module):
         S5 = _resize(s5_raw, size)
         Sg = _resize(sg_raw, size)
 
-        w = self.ds_weights_buf
+        w = self.ds_weights
         fused_logits = w[0] * S3 + w[1] * S4 + w[2] * S5 + w[3] * Sg
         pred = torch.sigmoid(fused_logits) if self.apply_sigmoid else fused_logits
 
@@ -544,31 +446,23 @@ class LGPSTiny(nn.Module):
         }
 
     def forward_with_attention(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Return predictions along with Sg and Reverse Attention maps R3, R4, R5.
-
-        Input: x [B,3,H,W]. Output: Dict with keys pred, S3, S4, S5, Sg, R3, R4, R5.
-        """
         return self.forward(x, return_attn=True)
 
-    def parameter_count(self, trainable_only: bool = False) -> int:
-        """Count model parameters.
+    def compute_loss(
+        self,
+        outputs: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute deep supervision loss to match repository requirements."""
+        if isinstance(outputs, torch.Tensor):
+            return self.loss_fn(outputs, target)
 
-        Input: trainable_only (bool). Output: exact integer count of parameters.
-        """
-        if trainable_only:
-            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        heads = [outputs["S3"], outputs["S4"], outputs["S5"], outputs["Sg"]]
+        loss_total = sum(w * self.loss_fn(h, target) for w, h in zip(self.ds_weights, heads))
+        return loss_total
+
+    def parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
-
-    def parameter_report(self) -> Dict[str, float]:
-        """Return summary dictionary of parameter counts against the 1M budget."""
-        total = self.parameter_count(trainable_only=False)
-        trainable = self.parameter_count(trainable_only=True)
-        return {
-            "total_params": float(total),
-            "trainable_params": float(trainable),
-            "params_m": float(total / 1e6),
-            "under_1m": bool(total < _MAX_TOTAL_PARAMS),
-        }
 
 
 __all__ = [
