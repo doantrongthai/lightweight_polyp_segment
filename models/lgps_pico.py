@@ -212,11 +212,11 @@ class MobileNetV3SmallMidBackbone(nn.Module):
         features = mobilenet_v3_small(weights=weights).features
 
         self.stage1 = features[0:1]   # Stride 2 (16 ch)
-        self.stage2 = features[1:2]   # Stride 4 (24 ch tùy cấu trúc slice, ở đây ta gom chuẩn)
+        self.stage2 = features[1:2]   # Stride 4 (24 ch)
         self.stage3 = features[2:4]   # Stride 8 (24 ch)
         self.stage4 = features[4:9]   # Stride 16 (40 ch)
         self.stage5 = features[9:11]  # Stride 32 (96 ch)
-        self.out_channels = (16, 24, 24, 40, 96)  # Đảm bảo đúng 5 giá trị khớp decode
+        self.out_channels = (16, 24, 24, 40, 96)
 
     def forward(self, x: torch.Tensor):
         f1 = self.stage1(x)
@@ -342,4 +342,65 @@ class LGPSPico(nn.Module):
         s3_refined = self.detail_head(detail_feat) + _resize_like(s3_raw, detail_feat)
 
         S3 = _resize(s3_refined, size)
-        if
+        if not return_attn and not self.training:
+            return torch.sigmoid(S3) if self.apply_sigmoid else S3
+
+        S4 = _resize(s4_raw, size)
+        S5 = _resize(s5_raw, size)
+        Sg = _resize(sg_raw, size)
+        Edge = _resize(self.edge_head(p3), size)
+
+        w = self.ds_weights
+        fused_logits = w[0] * S3 + w[1] * S4 + w[2] * S5 + w[3] * Sg
+        pred = torch.sigmoid(fused_logits) if self.apply_sigmoid else fused_logits
+
+        if not return_attn:
+            return pred
+
+        return {
+            "pred": pred,
+            "S3": S3,
+            "S4": S4,
+            "S5": S5,
+            "Sg": Sg,
+            "Edge": Edge,
+            "R3": _resize(r3_raw, size),
+            "R4": _resize(r4_raw, size),
+            "R5": _resize(r5_raw, size),
+        }
+
+    def forward_with_attention(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return self.forward(x, return_attn=True)
+
+    def compute_loss(self, outputs: Union[torch.Tensor, Dict[str, torch.Tensor]], target: torch.Tensor):
+        if isinstance(outputs, torch.Tensor):
+            return self.loss_fn(outputs, target)
+
+        if target.ndim == 3:
+            target_mask = target.unsqueeze(1).float()
+        else:
+            target_mask = target.float()
+        
+        lap_kernel = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32, device=target.device).view(1, 1, 3, 3)
+        edge_gt = (torch.abs(F.conv2d(target_mask, lap_kernel, padding=1)) > 0.1).float()
+
+        heads = [outputs["S3"], outputs["S4"], outputs["S5"], outputs["Sg"]]
+        w = self.ds_weights
+        loss_seg = sum(w[i] * self.loss_fn(heads[i], target) for i in range(4))
+        loss_edge = w[3] * self.edge_loss_fn(outputs["Edge"], edge_gt)
+
+        return loss_seg + loss_edge
+
+    def parameter_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+__all__ = [
+    "LGPSPico",
+    "LGPSPicoConfig",
+    "MobileNetV3SmallMidBackbone",
+    "GhostPPD",
+    "ReverseAttention",
+    "BoundaryPerceptionModule",
+    "FocalTverskyStructureLoss",
+]
