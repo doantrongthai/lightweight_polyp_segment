@@ -14,20 +14,25 @@ _MAX_TOTAL_PARAMS = 200_000
 
 @dataclass
 class LGPSPicoConfig:
-    """Hyperparameter configuration for LGPSPico architecture and loss."""
+    """
+    Cấu hình siêu tham số cho kiến trúc và hàm mất mát của LGPSPico.
+    """
     pretrained: bool = True
-    decoder_channels: int = 14
-    rfb_branch_channels: int = 4
-    ra_hidden_channels: int = 10
-    bpm_hidden_channels: int = 8
-    detail_channels: int = 12
+    decoder_channels: int = 18
+    rfb_branch_channels: int = 6
+    ra_hidden_channels: int = 12
+    bpm_hidden_channels: int = 10
+    detail_channels: int = 14
     ds_weights: Tuple[float, float, float] = (0.4, 0.4, 0.2)
-    boundary_factor: float = 4.0
+    boundary_factor: float = 6.0
 
 
 def _resize(x: torch.Tensor, size: Sequence[int]) -> torch.Tensor:
-    """Resize a 4D tensor to target spatial size using bilinear interpolation.
-    Input: x [B,C,h,w], size (H,W). Output: [B,C,H,W].
+    """
+    Co giãn tensor 4 chiều về kích thước không gian mục tiêu bằng phép nội suy song tuyến tính.
+    Input: x [B, C, h, w], size (H, W).
+    Output: [B, C, H, W].
+    Nguồn: Quy chuẩn sắp xếp không gian chuẩn FCN/UNet.
     """
     target = tuple(size)
     if x.shape[-2:] == target:
@@ -36,15 +41,21 @@ def _resize(x: torch.Tensor, size: Sequence[int]) -> torch.Tensor:
 
 
 def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """Resize a 4D tensor to match spatial dimensions of a reference tensor.
-    Input: x [B,C,h,w], ref [B,D,H,W]. Output: [B,C,H,W].
+    """
+    Co giãn tensor x theo kích thước không gian của tensor tham chiếu ref.
+    Input: x [B, C, h, w], ref [B, D, H, W].
+    Output: [B, C, H, W].
+    Nguồn: PraNet (Fan et al., MICCAI 2020).
     """
     return _resize(x, ref.shape[-2:])
 
 
 class ConvBNAct(nn.Module):
-    """Standard Convolution + BatchNorm + SiLU activation block.
-    Input: [B,Cin,H,W]. Output: [B,Cout,H/s,W/s].
+    """
+    Khối tích hợp Convolution, BatchNorm và hàm kích hoạt SiLU.
+    Input: [B, Cin, H, W].
+    Output: [B, Cout, H/s, W/s].
+    Nguồn: MobileNetV3 / EfficientNet (Howard et al., ICCV 2019).
     """
     def __init__(
         self,
@@ -76,8 +87,11 @@ class ConvBNAct(nn.Module):
 
 
 class DepthwiseSeparableConv(nn.Module):
-    """Depthwise-separable 2D convolution block.
-    Input: [B,Cin,H,W]. Output: [B,Cout,H,W].
+    """
+    Khối tích hợp chập tách chiều sâu (Depthwise Separable Convolution).
+    Input: [B, Cin, H, W].
+    Output: [B, Cout, H, W].
+    Nguồn: MobileNets (Howard et al., arXiv 2017).
     """
     def __init__(
         self,
@@ -108,8 +122,11 @@ class DepthwiseSeparableConv(nn.Module):
 
 
 class ECA(nn.Module):
-    """Efficient Channel Attention module.
-    Input: [B,C,H,W]. Output: [B,C,H,W].
+    """
+    Mô-đun chú ý kênh hiệu quả (Efficient Channel Attention).
+    Input: [B, C, H, W].
+    Output: [B, C, H, W].
+    Nguồn: ECA-Net (Wang et al., CVPR 2020).
     """
     def __init__(self, channels: int, kernel_size: int = 3) -> None:
         super().__init__()
@@ -123,10 +140,13 @@ class ECA(nn.Module):
 
 
 class ModifiedRFB(nn.Module):
-    """Lightweight Modified Receptive Field Block.
-    Input: [B,Cin,H,W]. Output: [B,Cout,H,W].
     """
-    def __init__(self, in_channels: int, out_channels: int, branch_channels: int = 4) -> None:
+    Khối trường thu nhận đa tỷ lệ cải tiến (Modified Receptive Field Block).
+    Input: [B, Cin, H, W].
+    Output: [B, Cout, H, W].
+    Nguồn: PraNet (Fan et al., MICCAI 2020).
+    """
+    def __init__(self, in_channels: int, out_channels: int, branch_channels: int = 6) -> None:
         super().__init__()
         self.shortcut = ConvBNAct(in_channels, out_channels, kernel_size=1, activation=False)
         self.b0 = ConvBNAct(in_channels, branch_channels, kernel_size=1)
@@ -149,14 +169,17 @@ class ModifiedRFB(nn.Module):
 
 
 class LitePPD(nn.Module):
-    """Lightweight Parallel Partial Decoder fusing multi-scale features.
-    Inputs: f2 [B,16,H/4,W/4], f3 [B,24,H/8,W/8], f4 [B,40,H/16,W/16]. Output: Sg [B,1,H/8,W/8].
+    """
+    Bộ giải mã một phần song song thu gọn (Lite Parallel Partial Decoder).
+    Inputs: f2 [B, 16, H/4, W/4], f3 [B, 24, H/8, W/8], f4 [B, 48, H/16, W/16].
+    Output: Sg [B, 1, H/8, W/8].
+    Nguồn: PraNet (Fan et al., MICCAI 2020).
     """
     def __init__(
         self,
-        in_channels_tuple: Tuple[int, int, int] = (16, 24, 40),
-        decoder_channels: int = 14,
-        rfb_branch_channels: int = 4,
+        in_channels_tuple: Tuple[int, int, int] = (16, 24, 48),
+        decoder_channels: int = 18,
+        rfb_branch_channels: int = 6,
     ) -> None:
         super().__init__()
         c2, c3, c4 = in_channels_tuple
@@ -176,7 +199,6 @@ class LitePPD(nn.Module):
         )
 
         self.up_conv1 = DepthwiseSeparableConv(dec, dec, kernel_size=3)
-        self.up_conv2 = DepthwiseSeparableConv(2 * dec, 2 * dec, kernel_size=3)
         self.concat_conv = DepthwiseSeparableConv(3 * dec, dec, kernel_size=3)
         self.head = nn.Sequential(
             DepthwiseSeparableConv(dec, dec, kernel_size=3),
@@ -205,10 +227,13 @@ class LitePPD(nn.Module):
 
 
 class BoundaryPerceptionModule(nn.Module):
-    """Boundary Perception Module combining depthwise convolutions and Laplacian prior.
-    Input: [B,Cin,H,W]. Output: [B,1,H,W].
     """
-    def __init__(self, in_channels: int, hidden_channels: int = 8) -> None:
+    Mô-đun nhận thức biên kết hợp chập tách chiều sâu và toán tử Laplacian.
+    Input: [B, Cin, H, W].
+    Output: [B, 1, H, W].
+    Nguồn: Cải tiến từ PraNet / BDG-Net.
+    """
+    def __init__(self, in_channels: int, hidden_channels: int = 10) -> None:
         super().__init__()
         kernel = torch.tensor(
             [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
@@ -232,10 +257,13 @@ class BoundaryPerceptionModule(nn.Module):
 
 
 class ReverseAttention(nn.Module):
-    """Reverse Attention block for residual edge refinement.
-    Inputs: feature [B,Cin,H,W], prev_pred [B,1,h,w]. Outputs: s_i, r_i, refined.
     """
-    def __init__(self, in_channels: int, hidden_channels: int = 10, bpm_hidden: int = 8) -> None:
+    Khối chú ý ngược (Reverse Attention) kết hợp cổng biên BPM.
+    Inputs: feature [B, Cin, H, W], prev_pred [B, 1, h, w].
+    Outputs: s_i, r_i, refined.
+    Nguồn: PraNet (Fan et al., MICCAI 2020).
+    """
+    def __init__(self, in_channels: int, hidden_channels: int = 12, bpm_hidden: int = 10) -> None:
         super().__init__()
         self.bpm = BoundaryPerceptionModule(in_channels, hidden_channels=bpm_hidden)
         self.pre = DepthwiseSeparableConv(in_channels, hidden_channels, kernel_size=3)
@@ -260,10 +288,12 @@ class ReverseAttention(nn.Module):
 
 
 class ShallowDetailRefiner(nn.Module):
-    """Lightweight detail injection from stride-2 f1 feature map.
-    Inputs: f1 [B,16,H/2,W/2], r3_feat [B,hidden,H/8,W/8]. Output: [B,detail_channels,H/4,W/4].
     """
-    def __init__(self, in_hidden: int = 10, detail_channels: int = 12) -> None:
+    Bộ tinh chỉnh chi tiết nông từ tầng f1 (stride 2).
+    Inputs: f1 [B, 16, H/2, W/2], r3_feat [B, hidden, H/8, W/8].
+    Output: [B, detail_channels, H/4, W/4].
+    """
+    def __init__(self, in_hidden: int = 12, detail_channels: int = 14) -> None:
         super().__init__()
         self.p1 = DepthwiseSeparableConv(16, 8, kernel_size=3)
         self.fuse = DepthwiseSeparableConv(in_hidden + 8, detail_channels, kernel_size=3)
@@ -276,19 +306,22 @@ class ShallowDetailRefiner(nn.Module):
 
 
 class MobileNetV3SmallPicoBackbone(nn.Module):
-    """Shallow ImageNet-pretrained MobileNetV3-Small encoder trunk (features[0:7]).
-    Input: RGB image [B,3,H,W]. Outputs: f1 (stride 2), f2 (stride 4), f3 (stride 8), f4 (stride 16).
+    """
+    Trục trích xuất đặc trưng MobileNetV3-Small tối ưu (features[0:9]).
+    Input: RGB image [B, 3, H, W].
+    Outputs: f1 (stride 2), f2 (stride 4), f3 (stride 8), f4 (stride 16).
+    Nguồn: Howard et al., "Searching for MobileNetV3", ICCV 2019.
     """
     def __init__(self, pretrained: bool = True) -> None:
         super().__init__()
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
         features = mobilenet_v3_small(weights=weights).features
 
-        self.stage1 = features[0:1]   # 16 channels, stride 2
-        self.stage2 = features[1:2]   # 16 channels, stride 4
-        self.stage3 = features[2:4]   # 24 channels, stride 8
-        self.stage4 = features[4:7]   # 40 channels, stride 16
-        self.out_channels = (16, 16, 24, 40)
+        self.stage1 = features[0:1]
+        self.stage2 = features[1:2]
+        self.stage3 = features[2:4]
+        self.stage4 = features[4:9]
+        self.out_channels = (16, 16, 24, 48)
 
     def forward(
         self,
@@ -302,8 +335,13 @@ class MobileNetV3SmallPicoBackbone(nn.Module):
 
 
 class WeightedIoUBCELoss(nn.Module):
-    """Weighted BCE + Weighted IoU loss with Laplacian boundary enhancement."""
-    def __init__(self, boundary_factor: float = 4.0, gamma: float = 2.0, pool_kernel: int = 31) -> None:
+    """
+    Hàm mất mát cấu trúc (Weighted BCE + Weighted IoU) với trọng số biên Laplacian mạnh.
+    Input: logits [B, 1, H, W], target [B, 1, H, W].
+    Output: scalar loss.
+    Nguồn: PraNet (Fan et al., MICCAI 2020).
+    """
+    def __init__(self, boundary_factor: float = 6.0, gamma: float = 2.0, pool_kernel: int = 31) -> None:
         super().__init__()
         self.boundary_factor = boundary_factor
         self.gamma = gamma
@@ -338,25 +376,27 @@ class WeightedIoUBCELoss(nn.Module):
 
 @register_model("lgps_pico")
 class LGPSPico(nn.Module):
-    """Ultra-lightweight polyp segmentation model targeting 100K–200K parameters.
-    Input: RGB tensor [B,3,H,W]. Output: single prediction tensor or attention dict.
+    """
+    Mô hình phân đoạn polyp siêu nhẹ định mức từ 100K đến 200K tham số.
+    Input: RGB tensor [B, 3, H, W].
+    Output: Tensor đơn hoặc từ điển chứa các tầng giám sát sâu.
     """
     def __init__(
         self,
         classes: int = 1,
         pretrained: bool = True,
-        decoder_channels: int = 14,
-        rfb_branch_channels: int = 4,
-        ra_hidden_channels: int = 10,
-        bpm_hidden_channels: int = 8,
+        decoder_channels: int = 18,
+        rfb_branch_channels: int = 6,
+        ra_hidden_channels: int = 12,
+        bpm_hidden_channels: int = 10,
         ds_weights: Tuple[float, float, float] = (0.4, 0.4, 0.2),
-        boundary_factor: float = 4.0,
+        boundary_factor: float = 6.0,
         apply_sigmoid: bool = False,
         config: Optional[LGPSPicoConfig] = None,
     ) -> None:
         super().__init__()
         if classes != 1:
-            raise ValueError("LGPSPico supports binary polyp segmentation with classes=1.")
+            raise ValueError("LGPSPico hỗ trợ phân đoạn nhị phân polyp với classes=1.")
 
         cfg = config or LGPSPicoConfig(
             pretrained=pretrained,
@@ -395,8 +435,8 @@ class LGPSPico(nn.Module):
         total = self.parameter_count()
         if not (_MIN_TOTAL_PARAMS <= total <= _MAX_TOTAL_PARAMS):
             raise RuntimeError(
-                f"LGPSPico parameter budget violation: {total:,} parameters "
-                f"(must be between {_MIN_TOTAL_PARAMS:,} and {_MAX_TOTAL_PARAMS:,})."
+                f"Vi phạm ngân sách tham số LGPSPico: {total:,} tham số "
+                f"(phải nằm trong khoảng từ {_MIN_TOTAL_PARAMS:,} đến {_MAX_TOTAL_PARAMS:,})."
             )
 
     def forward(
