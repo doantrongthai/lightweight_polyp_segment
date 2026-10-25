@@ -18,10 +18,10 @@ class LGPSPicoConfig:
     Cấu hình siêu tham số cho phiên bản LGPSPico Mid-Scale (300K - 700K params).
     """
     pretrained: bool = True
-    decoder_channels: int = 24
-    ra_hidden_channels: int = 20
+    decoder_channels: int = 32
+    ra_hidden_channels: int = 24
     bpm_hidden_channels: int = 16
-    detail_channels: int = 20
+    detail_channels: int = 24
     ds_weights: Tuple[float, float, float, float] = (0.35, 0.35, 0.2, 0.1)
     boundary_factor: float = 6.0
     alpha: float = 0.3
@@ -40,30 +40,56 @@ def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return _resize(x, ref.shape[-2:])
 
 
-class GhostModule(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 1, ratio: int = 2) -> None:
+class ConvBNAct(nn.Module):
+    """
+    Khối Convolution + BatchNorm + SiLU chuẩn, an toàn tuyệt đối trước mọi lỗi chia nhóm kênh.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        dilation: int = 1,
+        groups: int = 1,
+        activation: bool = True,
+    ) -> None:
         super().__init__()
-        init_channels = max(out_channels // ratio, 4)
-        new_channels = out_channels - init_channels
-
-        self.primary_conv = nn.Sequential(
-            nn.Conv2d(in_channels, init_channels, kernel_size, stride=1, padding=kernel_size // 2, bias=False),
-            nn.BatchNorm2d(init_channels),
-            nn.SiLU(inplace=True),
+        padding = (kernel_size - 1) * dilation // 2
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
         )
-        self.cheap_operation = nn.Sequential(
-            nn.Conv2d(init_channels, new_channels, 3, 1, 1, groups=init_channels, bias=False),
-            nn.BatchNorm2d(new_channels),
-            nn.SiLU(inplace=True),
-        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.SiLU(inplace=True) if activation else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1 = self.primary_conv(x)
-        x2 = self.cheap_operation(x1)
-        return torch.cat([x1, x2], dim=1)
+        return self.act(self.bn(self.conv(x)))
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """
+    Chập tách chiều sâu chuẩn, tiết kiệm tham số và cực kỳ ổn định.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, dilation: int = 1) -> None:
+        super().__init__()
+        self.dw = ConvBNAct(in_channels, in_channels, kernel_size=kernel_size, dilation=dilation, groups=in_channels, activation=True)
+        self.pw = ConvBNAct(in_channels, out_channels, kernel_size=1, activation=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pw(self.dw(x))
 
 
 class ECA(nn.Module):
+    """
+    Mô-đun chú ý kênh hiệu quả (Efficient Channel Attention).
+    """
     def __init__(self, channels: int, kernel_size: int = 3) -> None:
         super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -75,57 +101,23 @@ class ECA(nn.Module):
         return x * y
 
 
-class LightASPP(nn.Module):
+class StablePPD(nn.Module):
     """
-    Atrous Spatial Pyramid Pooling mở rộng vùng tiếp nhận đa tỷ lệ.
+    Bộ giải mã một phần song song (Parallel Partial Decoder) ổn định dựa trên ConvBNAct.
     """
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__()
-        mid = max(out_channels // 4, 4)
-        self.branch1 = GhostModule(in_channels, mid, 1)
-        self.branch2 = nn.Sequential(
-            GhostModule(in_channels, mid, 1),
-            nn.Conv2d(mid, mid, 3, padding=2, dilation=2, groups=mid, bias=False),
-            nn.BatchNorm2d(mid),
-            nn.SiLU(inplace=True),
-        )
-        self.branch3 = nn.Sequential(
-            GhostModule(in_channels, mid, 1),
-            nn.Conv2d(mid, mid, 3, padding=4, dilation=4, groups=mid, bias=False),
-            nn.BatchNorm2d(mid),
-            nn.SiLU(inplace=True),
-        )
-        self.pool_branch = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, mid, 1, bias=False),
-            nn.BatchNorm2d(mid),
-            nn.SiLU(inplace=True),
-        )
-        self.fuse = GhostModule(mid * 4, out_channels, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        size = x.shape[2:]
-        b1 = self.branch1(x)
-        b2 = self.branch2(x)
-        b3 = self.branch3(x)
-        bp = F.interpolate(self.pool_branch(x), size=size, mode="bilinear", align_corners=False)
-        return self.fuse(torch.cat([b1, b2, b3, bp], dim=1))
-
-
-class GhostPPD(nn.Module):
-    def __init__(self, in_channels_tuple: Tuple[int, int, int] = (24, 48, 96), decoder_channels: int = 24) -> None:
+    def __init__(self, in_channels_tuple: Tuple[int, int, int] = (24, 48, 96), decoder_channels: int = 32) -> None:
         super().__init__()
         c3, c4, c5 = in_channels_tuple
         dec = decoder_channels
 
-        self.proj3 = GhostModule(c3, dec, kernel_size=1)
-        self.proj4 = LightASPP(c4, dec)
-        self.proj5 = GhostModule(c5, dec, kernel_size=1)
+        self.proj3 = ConvBNAct(c3, dec, kernel_size=1)
+        self.proj4 = ConvBNAct(c4, dec, kernel_size=1)
+        self.proj5 = ConvBNAct(c5, dec, kernel_size=1)
 
-        self.up_conv1 = GhostModule(dec, dec, kernel_size=3)
-        self.concat_conv = GhostModule(3 * dec, dec, kernel_size=3)
+        self.up_conv1 = DepthwiseSeparableConv(dec, dec, kernel_size=3)
+        self.concat_conv = DepthwiseSeparableConv(3 * dec, dec, kernel_size=3)
         self.head = nn.Sequential(
-            GhostModule(dec, dec, kernel_size=3),
+            DepthwiseSeparableConv(dec, dec, kernel_size=3),
             ECA(dec),
             nn.Conv2d(dec, 1, kernel_size=1),
         )
@@ -147,13 +139,16 @@ class GhostPPD(nn.Module):
 
 
 class BoundaryPerceptionModule(nn.Module):
+    """
+    Mô-đun nhận thức biên kết hợp Laplacian và Conv tiêu chuẩn.
+    """
     def __init__(self, in_channels: int, hidden_channels: int = 16) -> None:
         super().__init__()
         kernel = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32).view(1, 1, 3, 3)
         self.register_buffer("laplacian", kernel)
-        self.b1 = GhostModule(in_channels, hidden_channels, kernel_size=3)
+        self.b1 = ConvBNAct(in_channels, hidden_channels, kernel_size=3)
         self.fuse = nn.Sequential(
-            GhostModule(hidden_channels, hidden_channels, kernel_size=3),
+            ConvBNAct(hidden_channels, hidden_channels, kernel_size=3),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
             nn.Sigmoid(),
         )
@@ -167,11 +162,14 @@ class BoundaryPerceptionModule(nn.Module):
 
 
 class ReverseAttention(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int = 20, bpm_hidden: int = 16) -> None:
+    """
+    Khối chú ý ngược (Reverse Attention) tiêu chuẩn cho PraNet.
+    """
+    def __init__(self, in_channels: int, hidden_channels: int = 24, bpm_hidden: int = 16) -> None:
         super().__init__()
         self.bpm = BoundaryPerceptionModule(in_channels, hidden_channels=bpm_hidden)
-        self.pre = GhostModule(in_channels, hidden_channels, kernel_size=3)
-        self.refine = GhostModule(hidden_channels, hidden_channels, kernel_size=3)
+        self.pre = ConvBNAct(in_channels, hidden_channels, kernel_size=3)
+        self.refine = ConvBNAct(hidden_channels, hidden_channels, kernel_size=3)
         self.eca = ECA(hidden_channels)
         self.pred = nn.Conv2d(hidden_channels, 1, kernel_size=1)
 
@@ -188,11 +186,14 @@ class ReverseAttention(nn.Module):
 
 
 class ShallowDetailRefiner(nn.Module):
-    def __init__(self, in_hidden: int = 20, detail_channels: int = 20) -> None:
+    """
+    Bộ tinh chỉnh chi tiết nông từ tầng f1, f2.
+    """
+    def __init__(self, in_hidden: int = 24, detail_channels: int = 24) -> None:
         super().__init__()
-        self.p1 = GhostModule(16, 12, kernel_size=3)
-        self.p2 = GhostModule(24, 12, kernel_size=3)
-        self.fuse = GhostModule(in_hidden + 24, detail_channels, kernel_size=3)
+        self.p1 = ConvBNAct(16, 12, kernel_size=3)
+        self.p2 = ConvBNAct(24, 12, kernel_size=3)
+        self.fuse = ConvBNAct(in_hidden + 24, detail_channels, kernel_size=3)
         self.eca = ECA(detail_channels)
 
     def forward(self, f1: torch.Tensor, f2: torch.Tensor, r3_feat: torch.Tensor):
@@ -204,7 +205,7 @@ class ShallowDetailRefiner(nn.Module):
 
 class MobileNetV3SmallMidBackbone(nn.Module):
     """
-    Trục trích xuất đặc trưng sâu hơn (features[0:11]) khớp chuẩn 5 cấp độ kênh.
+    Trục trích xuất đặc trưng MobileNetV3-Small (features[0:11]) trả về 5 cấp độ kênh chính xác.
     """
     def __init__(self, pretrained: bool = True) -> None:
         super().__init__()
@@ -214,7 +215,7 @@ class MobileNetV3SmallMidBackbone(nn.Module):
         self.stage1 = features[0:1]   # Stride 2 (16 ch)
         self.stage2 = features[1:2]   # Stride 4 (24 ch)
         self.stage3 = features[2:4]   # Stride 8 (24 ch)
-        self.stage4 = features[4:9]   # Stride 16 (48 ch thực tế)
+        self.stage4 = features[4:9]   # Stride 16 (48 ch)
         self.stage5 = features[9:11]  # Stride 32 (96 ch)
         self.out_channels = (16, 24, 24, 48, 96)
 
@@ -228,6 +229,9 @@ class MobileNetV3SmallMidBackbone(nn.Module):
 
 
 class FocalTverskyStructureLoss(nn.Module):
+    """
+    Hàm mất mát cấu trúc kết hợp Focal Tversky và Laplacian Boundary Loss.
+    """
     def __init__(self, alpha: float = 0.3, beta: float = 0.7, gamma: float = 2.0, boundary_factor: float = 6.0) -> None:
         super().__init__()
         self.alpha = alpha
@@ -260,14 +264,14 @@ class FocalTverskyStructureLoss(nn.Module):
 @register_model("lgps_pico")
 class LGPSPico(nn.Module):
     """
-    Mô hình LGPSPico phiên bản Mid-Scale (~500K params).
+    Mô hình LGPSPico phiên bản Mid-Scale ổn định (~500K params).
     """
     def __init__(
         self,
         classes: int = 1,
         pretrained: bool = True,
-        decoder_channels: int = 24,
-        ra_hidden_channels: int = 20,
+        decoder_channels: int = 32,
+        ra_hidden_channels: int = 24,
         bpm_hidden_channels: int = 16,
         ds_weights: Tuple[float, float, float, float] = (0.35, 0.35, 0.2, 0.1),
         boundary_factor: float = 6.0,
@@ -301,7 +305,7 @@ class LGPSPico(nn.Module):
         ra_ch = cfg.ra_hidden_channels
         bpm_ch = cfg.bpm_hidden_channels
 
-        self.ppd = GhostPPD(in_channels_tuple=(c3, c4, c5), decoder_channels=dec_ch)
+        self.ppd = StablePPD(in_channels_tuple=(c3, c4, c5), decoder_channels=dec_ch)
         self.ra5 = ReverseAttention(dec_ch, hidden_channels=ra_ch, bpm_hidden=bpm_ch)
         self.ra4 = ReverseAttention(dec_ch, hidden_channels=ra_ch, bpm_hidden=bpm_ch)
         self.ra3 = ReverseAttention(dec_ch, hidden_channels=ra_ch, bpm_hidden=bpm_ch)
@@ -310,8 +314,8 @@ class LGPSPico(nn.Module):
         self.detail_head = nn.Conv2d(cfg.detail_channels, 1, kernel_size=1)
 
         self.edge_head = nn.Sequential(
-            GhostModule(dec_ch, 12, kernel_size=3),
-            nn.Conv2d(12, 1, kernel_size=1),
+            ConvBNAct(dec_ch, 16, kernel_size=3),
+            nn.Conv2d(16, 1, kernel_size=1),
         )
 
         self.loss_fn = FocalTverskyStructureLoss(
@@ -399,7 +403,7 @@ __all__ = [
     "LGPSPico",
     "LGPSPicoConfig",
     "MobileNetV3SmallMidBackbone",
-    "GhostPPD",
+    "StablePPD",
     "ReverseAttention",
     "BoundaryPerceptionModule",
     "FocalTverskyStructureLoss",
